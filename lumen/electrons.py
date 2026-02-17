@@ -26,7 +26,7 @@ def electron_distribution(gamma, p_index, gamma_min, gamma_max):
     Smoothed power-law with exponential cutoffs:
         f_e(γ) = γ^{-p} · exp(-γ/γ_max - γ_min/γ)
     """
-    return gamma ** (-p_index) * jnp.exp(-gamma / gamma_max - gamma_min / gamma)
+    return gamma ** (-p_index)# * jnp.exp(-gamma / gamma_max - gamma_min / gamma)
 
 
 # ------------------------------------------------------------------ #

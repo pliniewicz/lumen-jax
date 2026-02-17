@@ -7,7 +7,8 @@ import matplotlib.pyplot as plt
 from lumen import (
     make_params, make_cosmology,
     observed_synchrotron, observed_ic, observed_sed,
-    MODEL_1B, kpc,
+    MODEL_1A, MODEL_1B, MODEL_2A, MODEL_2B, MODEL_3A, MODEL_3B, 
+    kpc,
 )
 
 params = make_params(
@@ -59,25 +60,27 @@ import time
 # --- Bulk simulation → HDF5 ---
 import h5py
 import numpy as np
+import sys
 
-N_sims = 50
-nu_out = jnp.logspace(8, 26, 200)
+N_sims = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+nu_out = jnp.logspace(3, 26, 200)
 
 # Parameter ranges: (name, lo, hi, log-scale?)
 param_ranges = [
     ("G0",        3.0,    25.0,   False),
-    ("p",         1.5,    3.5,    False),
-    ("theta",     2.0,    30.0,   False),
-    # ("gamma_min", 1e1,    1e4,    True),
-    # ("gamma_max", 1e4,    1e8,    True),
+    ("p",         2.0,    3.5,    False),
+    ("theta",     5.0,    40.0,   False),
+    ("gamma_min", 1e1,    1e4,    True),
+    ("gamma_max", 1e4,    1e8,    True),
     ("Rj",        0.1*kpc, 50*kpc, True),
     ("Lj",        1e44,   1e49,   True),
     ("l",         1*kpc,  100*kpc, True),
+    ("z",         0,        6,    False),
 ]
 
 # Fixed params not being sampled
 fixed_q_ratio = 1.0
-fixed_z = 2.5
+# fixed_z = 2.5
 fixed_eta_e = 0.1
 fixed_model = MODEL_1B
 
@@ -98,6 +101,9 @@ log_gamma_max = rng.uniform(log_gamma_min + log_gamma_gap, 6)
 samples["gamma_min"] = 10 ** log_gamma_min
 samples["gamma_max"] = 10 ** log_gamma_max
 
+models = [MODEL_1A, MODEL_1B, MODEL_2A, MODEL_2B, MODEL_3A, MODEL_3B]
+samples["model"] = rng.choice(models, N_sims)
+
 print(f"\nBulk run: {N_sims} simulations, {len(nu_out)} freqs each...")
 all_seds = np.zeros((N_sims, len(nu_out)))
 
@@ -113,12 +119,14 @@ for i in range(N_sims):
         Rj=samples["Rj"][i],
         Lj=samples["Lj"][i],
         l=samples["l"][i],
-        z=fixed_z,
+        z=samples["z"][i],
+        # z=fixed_z,
         eta_e=fixed_eta_e,
-        model=fixed_model,
+        # model=fixed_model,
+        model=int(samples["model"][i])
     )
     sed_i = observed_sed(nu_out, p_i, cosmo, nx=NX, ngamma=NG).block_until_ready()
-    all_seds[i] = np.asarray(log10(sed_i))
+    all_seds[i] = np.asarray(sed_i)
 
 dt_bulk = time.perf_counter() - t0
 print(f"  Done in {dt_bulk:.1f}s  ({dt_bulk/N_sims*1e3:.1f} ms/sim)")
@@ -132,10 +140,11 @@ with h5py.File(outfile, "w") as f:
     grp = f.create_group("params")
     for name, _, _, _ in param_ranges:
         grp.create_dataset(name, data=samples[name])
+    grp.create_dataset("model", data=samples["model"].astype(np.int32))
     # Store fixed values as attributes
     grp.attrs["q_ratio"] = fixed_q_ratio
-    grp.attrs["z"] = fixed_z
+    # grp.attrs["z"] = fixed_z
     grp.attrs["eta_e"] = fixed_eta_e
-    grp.attrs["model"] = fixed_model
+    # grp.attrs["model"] = fixed_model
 
 print(f"  Saved {outfile}  ({N_sims} SEDs × {len(nu_out)} freqs)")
