@@ -252,7 +252,7 @@ def add_noise_and_limits(rng, true_flux, mask, min_snr_for_det=2.0):
 
 def generate_bank(n_sims, output_path, nx=48, ngamma=64, seed=42,
                   flux_lo=1e-20, flux_hi=1e-10, min_detectable=3,
-                  oversample=2.0):
+                  oversample=2.0, n_workers=8):
     """
     Generate bank with rejection sampling for physical plausibility.
 
@@ -260,33 +260,27 @@ def generate_bank(n_sims, output_path, nx=48, ngamma=64, seed=42,
     ----------
     flux_lo, flux_hi : float
         Plausible νFν range [erg/s/cm²]. SEDs with peak flux outside
-        this range are rejected. Typical quasar jet knots have peak
-        νFν ~ 1e-16 to 1e-12, but we keep a wider range for diversity.
+        this range are rejected.
     min_detectable : int
-        Minimum number of slots with flux > 1e-19 (roughly Chandra
-        sensitivity limit). Ensures every training SED has enough
-        "in principle detectable" points.
+        Minimum number of slots with flux > flux_lo.
     oversample : float
         Draw this many extra parameter sets to compensate for rejects.
+    n_workers : int
+        Number of threads for parallel SED computation.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     rng = np.random.default_rng(seed)
 
-    # We oversample parameters, then keep only the first n_sims that pass
-    n_draw = int(n_sims * oversample)
-    print(f"Sampling {n_draw} parameter vectors (target: {n_sims} after cuts)...")
-    params = sample_parameters(rng, n_draw)
-
     cosmo = make_cosmology(71.0, 0.27, 0.73)
+    nu_jax = jnp.array(SLOT_FREQUENCIES)
 
     # Output arrays (pre-allocate for n_sims, fill incrementally)
     all_true_flux = np.zeros((n_sims, N_SLOTS), dtype=np.float64)
     all_obs_flux  = np.zeros((n_sims, N_SLOTS), dtype=np.float64)
     all_obs_err   = np.zeros((n_sims, N_SLOTS), dtype=np.float64)
     all_obs_mask  = np.zeros((n_sims, N_SLOTS), dtype=np.float32)
-    # Parameter arrays for accepted sims
-    accepted_params = {k: np.zeros(n_sims, dtype=params[k].dtype) for k in params}
-
-    nu_jax = jnp.array(SLOT_FREQUENCIES)
+    accepted_params = {}  # filled after first batch
 
     # Warm-up JIT for each model
     print("Warming up JIT (one call per model)...")
@@ -299,10 +293,32 @@ def generate_bank(n_sims, output_path, nx=48, ngamma=64, seed=42,
         )
         _ = observed_sed(nu_jax, p_warmup, cosmo, nx=nx, ngamma=ngamma).block_until_ready()
 
-    print(f"Generating {n_sims} plausible simulations ({N_SLOTS} instrument slots)...")
-    print(f"  Flux cuts: [{flux_lo:.0e}, {flux_hi:.0e}] erg/s/cm²")
-    print(f"  Min detectable slots: {min_detectable}")
-    t0 = time.perf_counter()
+    def compute_one_sed(idx, params_dict):
+        """Compute SED for parameter index idx. Thread-safe (JAX releases GIL)."""
+        p_i = make_params(
+            G0=params_dict["G0"][idx],
+            q_ratio=params_dict["q_ratio"][idx],
+            p=params_dict["p"][idx],
+            theta=params_dict["theta"][idx],
+            gamma_min=params_dict["gamma_min"][idx],
+            gamma_max=params_dict["gamma_max"][idx],
+            Rj=params_dict["Rj"][idx],
+            Lj=params_dict["Lj"][idx],
+            l=params_dict["l"][idx],
+            z=params_dict["z"][idx],
+            eta_e=params_dict["eta_e"][idx],
+            model=int(params_dict["model"][idx]),
+        )
+        try:
+            sed = np.asarray(
+                observed_sed(nu_jax, p_i, cosmo, nx=nx, ngamma=ngamma).block_until_ready()
+            )
+            return idx, sed
+        except Exception:
+            return idx, None
+
+    # --- Main loop: draw batches, compute in parallel, filter ---
+    BATCH_SIZE = max(n_workers * 16, 256)  # keep pool fed
 
     n_accepted = 0
     n_tried = 0
@@ -310,105 +326,105 @@ def generate_bank(n_sims, output_path, nx=48, ngamma=64, seed=42,
     n_flux_lo = 0
     n_flux_hi = 0
     n_too_few = 0
-    draw_idx = 0
+    draw_cursor = 0      # how far into params we've consumed
+    params = None         # current parameter bank
 
-    while n_accepted < n_sims:
-        # If we exhaust the initial draw, sample more
-        if draw_idx >= n_draw:
-            extra = int(n_sims * 0.5)
-            print(f"  Exhausted initial draw, sampling {extra} more...")
-            extra_params = sample_parameters(rng, extra)
-            for k in params:
-                params[k] = np.concatenate([params[k], extra_params[k]])
-            n_draw += extra
+    print(f"Generating {n_sims} plausible simulations ({N_SLOTS} instrument slots)")
+    print(f"  Workers: {n_workers}  |  Batch: {BATCH_SIZE}")
+    print(f"  Flux cuts: [{flux_lo:.0e}, {flux_hi:.0e}] erg/s/cm²")
+    print(f"  Min detectable slots: {min_detectable}")
+    t0 = time.perf_counter()
 
-        i = draw_idx
-        draw_idx += 1
-        n_tried += 1
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        while n_accepted < n_sims:
+            # Ensure we have enough unprocessed parameter sets
+            if params is None or draw_cursor + BATCH_SIZE > len(params["G0"]):
+                n_new = max(int((n_sims - n_accepted) * oversample), BATCH_SIZE * 2)
+                print(f"  Sampling {n_new} new parameter vectors...")
+                new_params = sample_parameters(rng, n_new)
+                if params is None:
+                    params = new_params
+                else:
+                    for k in params:
+                        params[k] = np.concatenate([params[k], new_params[k]])
 
-        # Build JetParams
-        p_i = make_params(
-            G0=params["G0"][i],
-            q_ratio=params["q_ratio"][i],
-            p=params["p"][i],
-            theta=params["theta"][i],
-            gamma_min=params["gamma_min"][i],
-            gamma_max=params["gamma_max"][i],
-            Rj=params["Rj"][i],
-            Lj=params["Lj"][i],
-            l=params["l"][i],
-            z=params["z"][i],
-            eta_e=params["eta_e"][i],
-            model=int(params["model"][i]),
-        )
+            # Select batch indices
+            batch_end = min(draw_cursor + BATCH_SIZE, len(params["G0"]))
+            batch_indices = list(range(draw_cursor, batch_end))
+            draw_cursor = batch_end
+            n_tried += len(batch_indices)
 
-        # Compute full SED at all slot frequencies
-        try:
-            sed = np.asarray(
-                observed_sed(nu_jax, p_i, cosmo, nx=nx, ngamma=ngamma).block_until_ready()
-            )
-        except Exception:
-            n_nan += 1
-            continue
+            # Dispatch to thread pool
+            futures = {
+                pool.submit(compute_one_sed, idx, params): idx
+                for idx in batch_indices
+            }
 
-        # --- Rejection criteria ---
+            # Collect results and apply rejection criteria
+            for future in as_completed(futures):
+                idx, sed = future.result()
 
-        # 1. NaN or all-zero
-        if np.any(np.isnan(sed)) or np.all(sed <= 0):
-            n_nan += 1
-            continue
+                # 1. Failed computation
+                if sed is None or np.any(np.isnan(sed)) or np.all(sed <= 0):
+                    n_nan += 1
+                    continue
 
-        # 2. Peak flux too low (undetectable by any instrument)
-        peak_flux = np.max(sed[sed > 0]) if np.any(sed > 0) else 0
-        if peak_flux < flux_lo:
-            n_flux_lo += 1
-            continue
+                # 2. Peak flux too low
+                peak_flux = np.max(sed[sed > 0]) if np.any(sed > 0) else 0
+                if peak_flux < flux_lo:
+                    n_flux_lo += 1
+                    continue
 
-        # 3. Peak flux too high (unphysical for a resolved jet feature)
-        if peak_flux > flux_hi:
-            n_flux_hi += 1
-            continue
+                # 3. Peak flux too high
+                if peak_flux > flux_hi:
+                    n_flux_hi += 1
+                    continue
 
-        # 4. Too few slots with detectable flux
-        n_detectable = np.sum(sed > flux_lo)
-        if n_detectable < min_detectable:
-            n_too_few += 1
-            continue
+                # 4. Too few detectable slots
+                if np.sum(sed > flux_lo) < min_detectable:
+                    n_too_few += 1
+                    continue
 
-        # --- Accepted! ---
-        j = n_accepted
+                # --- Accepted! ---
+                if n_accepted >= n_sims:
+                    break  # got enough from this batch
 
-        all_true_flux[j] = sed
+                j = n_accepted
+                all_true_flux[j] = sed
 
-        # Store accepted parameters
-        for k in params:
-            accepted_params[k][j] = params[k][i]
+                # Store accepted parameters
+                if not accepted_params:
+                    accepted_params = {
+                        k: np.zeros(n_sims, dtype=params[k].dtype)
+                        for k in params
+                    }
+                for k in params:
+                    accepted_params[k][j] = params[k][idx]
 
-        # Draw instrument mask
-        inst_mask = sample_instrument_mask(rng)
+                # Noise and masking (fast, fine in main thread)
+                inst_mask = sample_instrument_mask(rng)
+                obs_flux, obs_err, obs_mask = add_noise_and_limits(
+                    rng, sed, inst_mask
+                )
+                all_obs_flux[j] = obs_flux
+                all_obs_err[j]  = obs_err
+                all_obs_mask[j] = obs_mask
 
-        # Add noise and upper limits
-        obs_flux, obs_err, obs_mask = add_noise_and_limits(rng, sed, inst_mask)
-        all_obs_flux[j] = obs_flux
-        all_obs_err[j]  = obs_err
-        all_obs_mask[j] = obs_mask
+                n_accepted += 1
 
-        n_accepted += 1
-
-        # Progress
-        if n_accepted % 500 == 0:
-            elapsed = time.perf_counter() - t0
-            rate = n_accepted / elapsed
-            eta = (n_sims - n_accepted) / rate
-            accept_rate = n_accepted / n_tried
-            print(f"  [{n_accepted:>7d}/{n_sims}]  "
-                  f"{rate:.1f} sims/s  ETA {eta/60:.1f}min  "
-                  f"accept {accept_rate:.0%}  "
-                  f"(lo={n_flux_lo} hi={n_flux_hi} "
-                  f"few={n_too_few} nan={n_nan})")
+                if n_accepted % 500 == 0:
+                    elapsed = time.perf_counter() - t0
+                    rate = n_accepted / elapsed
+                    eta = (n_sims - n_accepted) / rate
+                    acc_rate = n_accepted / n_tried
+                    print(f"  [{n_accepted:>7d}/{n_sims}]  "
+                          f"{rate:.1f} sims/s  ETA {eta/60:.1f}min  "
+                          f"accept {acc_rate:.0%}  "
+                          f"(lo={n_flux_lo} hi={n_flux_hi} "
+                          f"few={n_too_few} nan={n_nan})")
 
     elapsed = time.perf_counter() - t0
-    accept_rate = n_accepted / n_tried
+    accept_rate = n_accepted / max(n_tried, 1)
     print(f"\nDone: {n_accepted} accepted / {n_tried} tried "
           f"({accept_rate:.0%} accept rate, {elapsed:.0f}s)")
     print(f"  Rejected — too faint: {n_flux_lo}, too bright: {n_flux_hi}, "
@@ -417,7 +433,6 @@ def generate_bank(n_sims, output_path, nx=48, ngamma=64, seed=42,
     # --- Write HDF5 ---
     print(f"Writing {output_path}...")
     with h5py.File(output_path, "w") as f:
-        # Instrument catalog (metadata)
         f.create_dataset("slot_frequencies", data=SLOT_FREQUENCIES)
         f.attrs["n_slots"] = N_SLOTS
         f.attrs["n_sims"] = n_sims
@@ -427,19 +442,17 @@ def generate_bank(n_sims, output_path, nx=48, ngamma=64, seed=42,
         f.attrs["flux_lo"] = flux_lo
         f.attrs["flux_hi"] = flux_hi
         f.attrs["accept_rate"] = accept_rate
+        f.attrs["n_workers"] = n_workers
 
-        # Store slot names as variable-length strings
         dt = h5py.string_dtype()
         f.create_dataset("slot_names", data=np.array(SLOT_NAMES, dtype=object), dtype=dt)
         f.create_dataset("slot_bands", data=np.array(SLOT_BANDS, dtype=object), dtype=dt)
 
-        # SEDs
-        f.create_dataset("true_flux", data=all_true_flux)      # (N, N_SLOTS) raw νFν
-        f.create_dataset("obs_flux",  data=all_obs_flux)       # (N, N_SLOTS) noisy νFν
-        f.create_dataset("obs_err",   data=all_obs_err)        # (N, N_SLOTS) 1σ errors
-        f.create_dataset("obs_mask",  data=all_obs_mask)       # (N, N_SLOTS) +1/-1/0
+        f.create_dataset("true_flux", data=all_true_flux)
+        f.create_dataset("obs_flux",  data=all_obs_flux)
+        f.create_dataset("obs_err",   data=all_obs_err)
+        f.create_dataset("obs_mask",  data=all_obs_mask)
 
-        # Parameters (only accepted ones!)
         grp = f.create_group("params")
         for key in ["G0", "p", "theta", "gamma_min", "gamma_max",
                      "Rj", "Lj", "l", "q_ratio", "z", "eta_e"]:
@@ -458,10 +471,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate SBI simulation bank")
     parser.add_argument("--n_sims", type=int, default=100_000)
     parser.add_argument("--output", type=str, default="bank.h5")
-    parser.add_argument("--nx", type=int, default=48)
-    parser.add_argument("--ngamma", type=int, default=64)
+    parser.add_argument("--nx", type=int, default=256)
+    parser.add_argument("--ngamma", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--flux_lo", type=float, default=1e-20,
+    parser.add_argument("--flux_lo", type=float, default=1e-19,
                         help="Min peak νFν [erg/s/cm²] to accept (default 1e-20)")
     parser.add_argument("--flux_hi", type=float, default=1e-10,
                         help="Max peak νFν [erg/s/cm²] to accept (default 1e-10)")
@@ -469,9 +482,12 @@ if __name__ == "__main__":
                         help="Min slots with flux > flux_lo (default 3)")
     parser.add_argument("--oversample", type=float, default=2.0,
                         help="Oversample factor for rejection (default 2.0)")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Number of threads for parallel SED computation (default 8)")
     args = parser.parse_args()
 
     generate_bank(args.n_sims, args.output, args.nx, args.ngamma, args.seed,
                   flux_lo=args.flux_lo, flux_hi=args.flux_hi,
                   min_detectable=args.min_detectable,
-                  oversample=args.oversample)
+                  oversample=args.oversample,
+                  n_workers=args.workers)
