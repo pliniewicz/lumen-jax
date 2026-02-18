@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Tmp files and data
+*.h5
+simulation_plots/
+*.pdf
+sbi-logs/
+*.pt
